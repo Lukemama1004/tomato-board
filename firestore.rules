@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ③ 把下面的 Email 改成管理者帳號(與 firebase-config.js 的 MANAGER_EMAIL 相同)
+    function isManager() {
+      return request.auth != null && request.auth.token.email == 'manager@example.com';
+    }
+
+    // 員工回報只能是這個格式
+    function validReport(r) {
+      return r is map
+        && r.keys().hasOnly(['result', 'reason', 'by', 'at'])
+        && r.result in ['done', 'notdone']
+        && r.reason is string && r.reason.size() <= 500
+        && r.by is string && r.by.size() <= 40
+        && r.at is string && r.at.size() <= 40;
+    }
+
+    // 排程設定、人員名單:所有人可讀,只有管理者可改
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if isManager();
+    }
+
+    // 分派、狀態、管理者備註:所有人可讀,只有管理者可改
+    match /status/{bucket} {
+      allow read: if true;
+      allow write: if isManager();
+    }
+
+    // 員工回報:所有人可讀;員工每次只能新增或修改一筆格式正確的回報,不能刪除
+    match /reports/{bucket} {
+      allow read: if true;
+      allow delete: if isManager();
+      // 每次寫入需附上 lastKey(本次回報的工作代碼),且只能動到這一筆
+      allow create: if isManager()
+        || (request.resource.data.lastKey is string
+            && request.resource.data.keys().hasOnly([request.resource.data.lastKey, 'lastKey'])
+            && validReport(request.resource.data[request.resource.data.lastKey]));
+      allow update: if isManager()
+        || (request.resource.data.lastKey is string
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([request.resource.data.lastKey, 'lastKey'])
+            && request.resource.data.diff(resource.data).removedKeys().size() == 0
+            && validReport(request.resource.data[request.resource.data.lastKey]));
+    }
+    // 工作紀錄(自動寫入):只有管理者可以讀;員工每次只能「新增」一筆格式正確的紀錄,不能修改或刪除舊紀錄
+    function validLog(e) {
+      return e is map
+        && e.keys().hasOnly(['at', 'key', 'code', 'task', 'rec', 'plan', 'who', 'role', 'action', 'detail'])
+        && e.at is string && e.at.size() <= 40
+        && e.key is string && e.key.size() <= 60
+        && e.code is string && e.code.size() <= 20
+        && e.task is string && e.task.size() <= 80
+        && e.rec is string && e.rec.size() <= 20
+        && e.plan is string && e.plan.size() <= 20
+        && e.who is string && e.who.size() <= 40
+        && e.role == 'staff'
+        && e.action in ['回報完成', '回報未完成']
+        && e.detail is string && e.detail.size() <= 500;
+    }
+    match /logs/{day} {
+      allow read, delete: if isManager();
+      allow create: if isManager()
+        || (request.resource.data.lastKey is string
+            && request.resource.data.keys().hasOnly([request.resource.data.lastKey, 'lastKey'])
+            && validLog(request.resource.data[request.resource.data.lastKey]));
+      allow update: if isManager()
+        || (request.resource.data.lastKey is string
+            && !(request.resource.data.lastKey in resource.data)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([request.resource.data.lastKey, 'lastKey'])
+            && request.resource.data.diff(resource.data).removedKeys().size() == 0
+            && validLog(request.resource.data[request.resource.data.lastKey]));
+    }
+  }
+}
