@@ -277,7 +277,7 @@ function connect(){
 }
 function scheduleRender(){
   const a=document.activeElement;
-  if(a&&(a.tagName==="TEXTAREA"||(a.tagName==="INPUT"&&a.closest("#view")))){pendingRender=true;return;}
+  if(a&&(a.tagName==="TEXTAREA"||(a.tagName==="INPUT"&&a.type!=="checkbox"&&a.closest("#view")))){pendingRender=true;return;}
   render();
 }
 document.addEventListener("focusout",()=>{setTimeout(()=>{if(pendingRender){pendingRender=false;scheduleRender();}},0);});
@@ -383,11 +383,30 @@ function showBanner(t){const b=$("#banner");b.textContent=t;b.hidden=false;}
 let toastTimer;
 function toast(t){const el=$("#toast");el.textContent=t;el.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.hidden=true,2200);}
 function fmtAt(iso){if(!iso)return"";const d=new Date(iso);return md(d)+" "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");}
-function staffOptions(sel){
-  const names=[...cfg.staff];
-  if(sel&&!names.includes(sel))names.push(sel);
-  return `<option value="">未分派</option>`+names.map(n=>`<option ${n===sel?"selected":""}>${esc(n)}</option>`).join("");
+/* ---------- multiple assignees: stored as "王小明、李大華" ---------- */
+const splitA=a=>String(a||"").split("、").map(s=>s.trim()).filter(Boolean);
+const hasA=(a,n)=>splitA(a).includes(n);
+let assignOpen="";          // key of the assign menu currently open
+function assignHTML(key,assignee){
+  const sel=splitA(assignee);
+  const names=[...cfg.staff,...sel.filter(n=>!cfg.staff.includes(n))];
+  return `<details class="assignbox" data-assignkey="${esc(key)}" ${assignOpen===key?"open":""}>
+    <summary class="assign ${sel.length?"":"empty"}" aria-label="分派給">${sel.length?esc(sel.join("、")):"未分派"}</summary>
+    <div class="assignmenu">${names.length?names.map(n=>`<label><input type="checkbox" data-act="assignchk" value="${esc(n)}" ${sel.includes(n)?"checked":""}>${esc(n)}</label>`).join("")
+      :`<span class="hint">請先到「排程設定」新增人員</span>`}
+      ${names.length?`<span class="hint">可勾選多人;任一人回報完成即算完成</span>`:""}</div>
+  </details>`;
 }
+(function(){const s=document.createElement("style");s.textContent=`
+.assignbox{display:inline-block;max-width:100%}
+.assignbox>summary{list-style:none;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
+.assignbox>summary::-webkit-details-marker{display:none}
+.assignbox>summary::after{content:" ▾";color:var(--muted)}
+.assignmenu{margin-top:6px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:4px;display:grid;gap:2px;min-width:170px}
+.assignmenu label{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.assignmenu label:hover{background:var(--surface-2)}
+.assignmenu input{width:18px;height:18px;accent-color:var(--leaf)}
+.assignmenu .hint{margin:4px 8px;white-space:normal}`;document.head.appendChild(s);})();
 function srcLinks(t){return (t.src||[]).map(k=>SRC[k]?`<a href="${SRC[k][1]}" target="_blank" rel="noopener">${esc(SRC[k][0])}</a>`:"").filter(Boolean).join("、");}
 function dateTag(t,late){return t.kind==="m"?`<span class="tag ${late?"late":""}">${late?"逾期・":""}預定 ${md(t.date)} 週</span>`:`<span class="tag">${FREQ_LABEL[t.freq]}</span>`;}
 function reportTag(key){
@@ -424,7 +443,7 @@ function rowHTML(t,ctx){
         ${mNote&&s.status==="issue"&&!isOpen?`<span class="notepreview">⚠ ${esc(mNote)}</span>`:""}
       </div>
       <div class="row-act">
-        <select class="assign ${s.assignee?"":"empty"}" data-act="assign" aria-label="分派給">${staffOptions(s.assignee)}</select>
+        ${assignHTML(t.key,s.assignee)}
         <div class="seg" role="group" aria-label="狀態">${STATUS.map(([v,l])=>`<button data-act="status" data-v="${v}" aria-pressed="${s.status===v}">${l}</button>`).join("")}</div>
       </div>
     </div>
@@ -440,7 +459,7 @@ function passFilter(t){
   if(personFilter==="all")return true;
   const a=st(t.key).assignee||"";
   if(personFilter==="__none")return !a;
-  return a===personFilter;
+  return hasA(a,personFilter);
 }
 function groupHTML(title,items,ctx,emptyText,rowFn){
   rowFn=rowFn||rowHTML;
@@ -457,7 +476,8 @@ function staffRowHTML(t,ctx){
   const asking=reasonOpen.has(t.key)||(s.status==="notdone");
   const shown=s.status==="notdone"?"issue":s.status;
   const mNote=(statusMap[t.key]||{}).note||"";
-  const stateText=s.status==="done"?`<span class="st done">已完成${s.fromReport?"":"(管理者確認)"}</span>`
+  const co=splitA(s.assignee).filter(n=>n!==me);
+  const stateText=s.status==="done"?`<span class="st done">已完成${s.fromReport?(s.by&&s.by!==me?`(${esc(s.by)} 回報)`:""):"(管理者確認)"}</span>`
     :s.status==="notdone"?`<span class="st issue">未完成</span>`
     :s.status==="doing"?`<span class="st doing">進行中</span>`
     :s.status==="issue"?`<span class="st issue">管理者標示異常</span>`:"";
@@ -466,7 +486,7 @@ function staffRowHTML(t,ctx){
       <div class="row-title">
         <span class="code">${esc(t.id)}</span>
         <button class="tname" data-act="toggle" aria-expanded="${isOpen}">${esc(t.t)}</button>
-        ${dateTag(t,ctx==="overdue")} ${stateText}
+        ${dateTag(t,ctx==="overdue")} ${stateText}${co.length?` <span class="tag">與 ${esc(co.join("、"))} 一起</span>`:""}
       </div>
       <div class="row-act">
         <div class="checks" role="group" aria-label="回報">
@@ -529,7 +549,7 @@ function viewToday(b){
     ${groupHTML("今日例行",f(b.daily),"daily",b.week<0?"尚未定植,每日例行工作從定植週開始。":"今日沒有例行工作。")}
     ${groupHTML("本週例行",f(b.weekly),"weekly")}
     ${groupHTML("本月例行",f(b.monthly),"monthly")}
-    ${b.upcoming.length?`<section class="group"><h2>未來兩週預告 <span class="count">${b.upcoming.length}</span></h2><div class="list">${b.upcoming.map(t=>`<div class="row" data-s="${st(t.key).status}" data-key="${t.key}"><div class="row-main"><div class="row-title"><span class="code">${t.id}</span><span>${esc(t.t)}</span><span class="tag">預定 ${md(t.date)} 週</span></div><div class="row-act"><select class="assign ${st(t.key).assignee?"":"empty"}" data-act="assign" aria-label="預先分派">${staffOptions(st(t.key).assignee)}</select></div></div></div>`).join("")}</div></section>`:""}
+    ${b.upcoming.length?`<section class="group"><h2>未來兩週預告 <span class="count">${b.upcoming.length}</span></h2><div class="list">${b.upcoming.map(t=>`<div class="row" data-s="${st(t.key).status}" data-key="${t.key}"><div class="row-main"><div class="row-title"><span class="code">${t.id}</span><span>${esc(t.t)}</span><span class="tag">預定 ${md(t.date)} 週</span></div><div class="row-act">${assignHTML(t.key,st(t.key).assignee)}</div></div></div>`).join("")}</div></section>`:""}
     ${feedHTML(b)}`;
 }
 function feedHTML(b){
@@ -550,7 +570,7 @@ function viewMine(b){
     return `<div class="pickme"><h2>請先選擇你的姓名</h2><p class="hint">選好後會記在這台裝置,只顯示分派給你的工作。</p>
       <div class="chips">${cfg.staff.map(n=>`<button class="chip big" data-pickme="${esc(n)}">${esc(n)}</button>`).join("")}</div></div>`;
   }
-  const mine=xs=>xs.filter(t=>(st(t.key).assignee||"")===me);
+  const mine=xs=>xs.filter(t=>hasA(st(t.key).assignee,me));
   const all=[...mine(b.overdue),...mine(b.thisWeek),...mine(b.daily),...mine(b.weekly),...mine(b.monthly)];
   const done=all.filter(t=>st(t.key).status==="done").length;
   const pct=all.length?Math.round(done/all.length*100):0;
@@ -582,7 +602,7 @@ function viewPlan(b){
   const filters=[["all","全部"],["open","未完成"],["late","逾期"],["issue","異常/未完成"],["done","已完成"]];
   if(!mgr&&me&&cfg.staff.includes(me))filters.splice(1,0,["mine","我的"]);
   const rows=[...M].sort((a,c)=>a.w-c.w||a.id.localeCompare(c.id)).filter(m=>{const s=st(m.key).status;
-    if(planFilter==="mine")return (st(m.key).assignee||"")===me;
+    if(planFilter==="mine")return hasA(st(m.key).assignee,me);
     if(planFilter==="open")return s!=="done";if(planFilter==="late")return s!=="done"&&m.w<b.week;if(planFilter==="issue")return s==="issue"||s==="notdone";if(planFilter==="done")return s==="done";return true;});
   const label=s=>s==="notdone"?"未完成":STATUS_LABEL[s];
   return `${mgr?"":`<div class="readonly">全期進度僅供參考,無法修改。回報請到「我的工作」。</div>`}
@@ -594,7 +614,7 @@ function viewPlan(b){
       return `<tr class="${m.w===b.week?"cur":""}" data-key="${m.key}">
       <td class="num">${md(m.date)}–${md(addDays(m.date,6))}</td><td class="num">${m.w}</td><td class="num">${m.id}</td>
       <td>${esc(m.t)}${late?` <span class="tag late">逾期</span>`:""}</td><td>${m.stage}</td>
-      <td>${mgr?`<select class="assign ${s.assignee?"":"empty"}" data-act="assign" aria-label="分派給">${staffOptions(s.assignee)}</select>`:(s.assignee?esc(s.assignee):`<span class="hint">未分派</span>`)}</td>
+      <td>${mgr?`${assignHTML(m.key,s.assignee)}`:(s.assignee?esc(s.assignee):`<span class="hint">未分派</span>`)}</td>
       <td><span class="st ${cls}">${label(s.status)}</span></td><td>${esc(expl)}</td></tr>`;}).join("")}
     </tbody></table></div>`;
 }
@@ -605,11 +625,12 @@ function viewPeople(b){
   const names=[...cfg.staff,"__none"];
   return `<div class="people">${names.map(n=>{
     const who=n==="__none"?"":n;
-    const mine=items.filter(t=>(st(t.key).assignee||"")===who);
+    const isWho=a=>who?hasA(a,who):!splitA(a).length;
+    const mine=items.filter(t=>isWho(st(t.key).assignee));
     const done=mine.filter(t=>st(t.key).status==="done").length;
     const bad=mine.filter(t=>["issue","notdone"].includes(st(t.key).status)).length;
     const openItems=mine.filter(t=>st(t.key).status!=="done");
-    const lateAll=b.all.filter(m=>m.w<b.week&&st(m.key).status!=="done"&&(st(m.key).assignee||"")===who).length;
+    const lateAll=b.all.filter(m=>m.w<b.week&&st(m.key).status!=="done"&&isWho(st(m.key).assignee)).length;
     return `<div class="person"><h3>${n==="__none"?"未分派":esc(n)}<span class="code">${mine.length?Math.round(done/mine.length*100):0}%</span></h3>
       <div class="nums"><span>今日 <b>${mine.length}</b></span><span>完成 <b>${done}</b></span><span>未完成/異常 <b>${bad}</b></span><span>逾期 <b>${lateAll}</b></span></div>
       <div class="progressline"><i style="width:${mine.length?done/mine.length*100:0}%"></i></div>
@@ -738,7 +759,7 @@ document.addEventListener("click",e=>{
   if(t.dataset.person!=null){personFilter=t.dataset.person;render();return;}
   if(t.dataset.planf){planFilter=t.dataset.planf;render();return;}
   if(t.dataset.delstaff){const n=t.dataset.delstaff;saveCfg({...cfg,staff:cfg.staff.filter(x=>x!==n)});return;}
-  if(t.id==="addStaffBtn"){e.preventDefault();const inp=$("#newStaff");const n=inp.value.trim();if(!n)return;if(cfg.staff.includes(n)){toast("名單中已有此人");return;}saveCfg({...cfg,staff:[...cfg.staff,n]});return;}
+  if(t.id==="addStaffBtn"){e.preventDefault();const inp=$("#newStaff");const n=inp.value.replace(/、/g,"").trim();if(!n)return;if(cfg.staff.includes(n)){toast("名單中已有此人");return;}saveCfg({...cfg,staff:[...cfg.staff,n]});return;}
   if(t.id==="prevDay"){viewDate=addDays(viewDate,-1);render();return;}
   if(t.id==="nextDay"){viewDate=addDays(viewDate,1);render();return;}
   if(t.id==="goToday"){viewDate=today;render();return;}
@@ -763,8 +784,17 @@ document.addEventListener("change",e=>{
   if(el.id==="logAct"){logAct=el.value;render();return;}
   if(el.id==="meSel"){me=el.value;try{localStorage.setItem("tomato.me",me);}catch(_){}render();return;}
   if(el.id==="datePick"&&el.value){viewDate=parseYmd(el.value);render();return;}
-  if(el.dataset.act==="assign"&&isManagerView()){const key=el.closest("[data-key]").dataset.key;setStatus(key,{assignee:el.value});return;}
+  if(el.dataset.act==="assignchk"&&isManagerView()){
+    const box=el.closest("details.assignbox");const key=box.dataset.assignkey;
+    const picked=[...box.querySelectorAll("input[data-act=assignchk]:checked")].map(i=>i.value);
+    assignOpen=key;setStatus(key,{assignee:picked.join("、")});return;}
 });
+document.addEventListener("toggle",e=>{
+  const d=e.target;if(!(d instanceof HTMLDetailsElement)||!d.classList.contains("assignbox"))return;
+  if(d.open){assignOpen=d.dataset.assignkey;document.querySelectorAll("details.assignbox[open]").forEach(x=>{if(x!==d)x.open=false;});}
+  else if(assignOpen===d.dataset.assignkey)assignOpen="";
+},true);
+document.addEventListener("pointerdown",e=>{if(assignOpen&&!e.target.closest("details.assignbox")){assignOpen="";document.querySelectorAll("details.assignbox[open]").forEach(x=>x.open=false);}});
 document.addEventListener("keydown",e=>{if(e.target.id==="newStaff"&&e.key==="Enter"){e.preventDefault();$("#addStaffBtn").click();}});
 document.addEventListener("submit",e=>{
   if(e.target.id==="loginForm"){e.preventDefault();
