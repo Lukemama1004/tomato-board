@@ -107,7 +107,7 @@ function setStatus_(d) {
   const by = str_(s.by, 40) || '管理者';
   const sh = sheet_('status');
   writeRow_(sh, findRow_(sh, key) || sh.getLastRow() + 1,
-    [key, str_(info.code, 20), str_(info.task, 80), STATUS_TEXT[s.status], str_(s.assignee, 40), str_(s.note, 1000), by, fmt_(at, 'yyyy-MM-dd HH:mm'), at]);
+    [key, str_(info.code, 20), str_(info.task, 80), STATUS_TEXT[s.status], str_(s.assignee, 300), str_(s.note, 1000), by, fmt_(at, 'yyyy-MM-dd HH:mm'), at]);
   (Array.isArray(d.logs) ? d.logs.slice(0, 5) : []).forEach(function (l) {
     appendLog_({ at: at, key: key, info: info, who: by, role: 'manager', action: l.action, detail: l.detail });
   });
