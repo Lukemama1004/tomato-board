@@ -1,10 +1,5 @@
-// 小番茄溫室作業板 — 資料存放於 Firebase Firestore
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getFirestore, doc, collection, onSnapshot, setDoc, query, where, documentId } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, reauthenticateWithCredential, updatePassword, EmailAuthProvider } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { FIREBASE_CONFIG, MANAGER_EMAIL } from "./firebase-config.js";
-
-const FB={initializeApp,getFirestore,doc,collection,onSnapshot,setDoc,query,where,documentId,getAuth,onAuthStateChanged,signInWithEmailAndPassword,signOut,sendPasswordResetEmail,reauthenticateWithCredential,updatePassword,EmailAuthProvider};
+// 小番茄溫室作業板 — 資料存放於 Google 試算表(透過 Apps Script 網頁應用程式)
+import { SHEET_API_URL } from "./sheet-config.js";
 
 /* ---------- defaults (from 種植工作計畫排程表) ---------- */
 const DEFAULT_CFG={plantDate:"2026-10-15",orderLead:2,flowerWeek:3,feedStart:4,feedInterval:3,feedCount:7,harvestWeek:11,endWeek:30,
@@ -127,9 +122,10 @@ function stageOf(w,c){if(w<0)return"作前準備";if(w<=1)return"定植緩苗";i
 let cfg={...DEFAULT_CFG};
 let statusMap={};           // manager-owned: key -> {status, assignee, note, by, at}
 let reportMap={};           // staff reports: key -> {result:"done"|"notdone", reason, by, at}
-let fs=null, fbAuth=null;
+let online=false, loaded=false;
 let role="pending";         // pending | online | local
-let user=null;
+let token="", sheetUrl="";  // manager login token (kept on this device)
+try{token=localStorage.getItem("tomato.mgrToken")||"";sheetUrl=localStorage.getItem("tomato.sheetUrl")||"";}catch(e){}
 let loginOpen=false;
 let today=parseYmd(ymd(new Date()));
 let viewDate=today;
@@ -139,7 +135,7 @@ const reasonOpen=new Set();
 let me="";
 try{me=localStorage.getItem("tomato.me")||"";}catch(e){}
 let pendingRender=false;
-const isManagerView=()=>role==="local"||(!!user&&user.email===MANAGER_EMAIL);
+const isManagerView=()=>role==="local"||(role==="online"&&!!token);
 
 /* ---------- instances ---------- */
 function build(date){
@@ -178,65 +174,105 @@ function st(key){
 
 
 
-/* ---------- storage buckets: a few documents instead of one per task ---------- */
-function bucketOf(key){
-  const i=key.indexOf("_");
-  if(i<0)return "milestones";
-  const rest=key.slice(i+1);
-  if(rest.startsWith("w"))return "weekly";
-  if(rest.startsWith("m"))return "monthly";
-  return "daily-"+rest.slice(0,7);
+/* ---------- Google 試算表 API ---------- */
+function saveToken(t,url){
+  token=t||"";if(url!==undefined&&/^https:\/\/docs\.google\.com\//.test(url||""))sheetUrl=url;
+  try{if(token)localStorage.setItem("tomato.mgrToken",token);else localStorage.removeItem("tomato.mgrToken");if(sheetUrl)localStorage.setItem("tomato.sheetUrl",sheetUrl);}catch(e){}
+}
+async function api(action,data){
+  let j;
+  try{
+    // 不加自訂 header(送 text/plain),瀏覽器才不會先送 CORS 預檢,Apps Script 才收得到
+    const res=await fetch(SHEET_API_URL,{method:"POST",body:JSON.stringify({action,token,...(data||{})})});
+    j=await res.json();
+  }catch(e){throw {error:"network"};}
+  if(!j||!j.ok){
+    const err=j||{error:"server"};
+    if(err.error==="auth"&&token){
+      saveToken("");unsubscribeLogs();loginOpen=false;
+      if(!["today","plan"].includes(tab))tab="today";
+      scheduleRender();toast("管理者登入已過期,請重新登入");
+    }
+    throw err;
+  }
+  return j;
+}
+function apiErr(e){
+  const c=e&&e.error||"";
+  if(c==="bad-password")return"密碼不正確";
+  if(c==="no-password")return"尚未設定管理者密碼(Apps Script 裡的 INITIAL_PASSWORD)";
+  if(c==="weak-password")return"新密碼至少 6 碼";
+  if(c==="network")return"網路連線失敗,請稍後再試";
+  if(c==="auth")return"請重新登入管理者";
+  return"發生錯誤,請稍後再試";
 }
 function writeErr(e){
-  const code=e&&e.code;
-  toast(code==="permission-denied"?"沒有權限修改,請重新登入管理者":"儲存失敗,請檢查網路後再試");
+  if(e&&e.error==="auth")return;
+  toast(e&&e.error==="network"?"儲存失敗,請檢查網路後再試":"儲存失敗,請稍後再試");
+}
+let pending=0;
+function write(action,data,okMsg){
+  pending++;
+  return api(action,data).then(j=>{if(okMsg)toast(okMsg);return j;}).catch(writeErr)
+    .finally(()=>{pending--;if(!pending)refresh();});
 }
 function setStatus(key,patch){
   const cur=statusMap[key]||{status:"todo",assignee:"",note:""};
   const nextDoc={status:cur.status||"todo",assignee:cur.assignee||"",note:cur.note||"",...patch,by:me||"管理者",at:new Date().toISOString()};
-  if(patch.status!==undefined&&patch.status!==(st(key).status))addLog(key,"狀態:"+STATUS_LABEL[patch.status],nextDoc.assignee?"負責:"+nextDoc.assignee:"");
-  if(patch.assignee!==undefined&&patch.assignee!==(cur.assignee||""))addLog(key,"分派",patch.assignee||"取消分派");
-  if(patch.note!==undefined&&patch.note!==(cur.note||""))addLog(key,"備註",patch.note);
+  const logs=[];
+  if(patch.status!==undefined&&patch.status!==(st(key).status))logs.push({action:"狀態:"+STATUS_LABEL[patch.status],detail:nextDoc.assignee?"負責:"+nextDoc.assignee:""});
+  if(patch.assignee!==undefined&&patch.assignee!==(cur.assignee||""))logs.push({action:"分派",detail:patch.assignee||"取消分派"});
+  if(patch.note!==undefined&&patch.note!==(cur.note||""))logs.push({action:"備註",detail:patch.note});
   statusMap={...statusMap,[key]:nextDoc};
   render();
-  if(fs)FB.setDoc(FB.doc(fs,"status",bucketOf(key)),{[key]:nextDoc},{merge:true}).catch(writeErr);
+  if(!online){logs.forEach(l=>addLocalLog(key,l.action,l.detail));return;}
+  write("setStatus",{key,doc:nextDoc,info:taskInfo(key),logs});
 }
 function setReport(key,result,reason){
   const d={result,reason:(reason||"").slice(0,500),by:(me||"未具名").slice(0,40),at:new Date().toISOString()};
-  addLog(key,result==="done"?"回報完成":"回報未完成",d.reason);
   reportMap={...reportMap,[key]:d};
   render();
-  if(fs)FB.setDoc(FB.doc(fs,"reports",bucketOf(key)),{[key]:d,lastKey:key},{merge:true})
-    .then(()=>toast(result==="done"?"已回報完成":"已送出未完成說明")).catch(writeErr);
+  const msg=result==="done"?"已回報完成":"已送出未完成說明";
+  if(!online){addLocalLog(key,result==="done"?"回報完成":"回報未完成",d.reason);toast(msg);return;}
+  write("setReport",{key,doc:d,info:taskInfo(key)},msg);
 }
 function saveCfg(next){
   cfg={...DEFAULT_CFG,...next};
   render();
-  if(fs)return FB.setDoc(FB.doc(fs,"config","main"),cfg).then(()=>toast("已儲存設定")).catch(writeErr);
+  if(online)return write("saveCfg",{cfg},"已儲存設定");
   toast("示範模式:設定不會儲存");
 }
-function connect(){
-  const offline=msg=>{role="local";showBanner(msg);render();};
-  if(!FIREBASE_CONFIG||!FIREBASE_CONFIG.apiKey||String(FIREBASE_CONFIG.apiKey).startsWith("請填")){
-    return offline("示範模式:尚未設定 Firebase(firebase-config.js),資料不會儲存,也不需要密碼。");
-  }
+let refreshing=false;
+async function refresh(){
+  if(!online||pending||refreshing)return;
+  refreshing=true;
   try{
-    const app=FB.initializeApp(FIREBASE_CONFIG);
-    fs=FB.getFirestore(app); fbAuth=FB.getAuth(app);
-  }catch(e){return offline("Firebase 設定有誤,請檢查 firebase-config.js。");}
-  role="online";
-  const lost=()=>showBanner("無法讀取共享資料,請確認網路或 Firebase 設定後重新整理。");
-  FB.onAuthStateChanged(fbAuth,u=>{
-    user=u;
-    if(!isManagerView())unsubscribeLogs();
-    if(!isManagerView()&&!["today","plan"].includes(tab))tab="today";
-    scheduleRender();
-  });
-  FB.onSnapshot(FB.doc(fs,"config","main"),s=>{if(s.exists())cfg={...DEFAULT_CFG,...s.data()};scheduleRender();},lost);
-  const merge=snap=>{const m={};snap.docs.forEach(d=>{const x={...d.data()};delete x.lastKey;Object.assign(m,x);});return m;};
-  FB.onSnapshot(FB.collection(fs,"status"),s=>{statusMap=merge(s);scheduleRender();},lost);
-  FB.onSnapshot(FB.collection(fs,"reports"),s=>{reportMap=merge(s);scheduleRender();},lost);
+    const j=await api("load");
+    if(!pending){
+      cfg={...DEFAULT_CFG,...(j.cfg||{})};statusMap=j.status||{};reportMap=j.reports||{};
+      if(lostBanner){$("#banner").hidden=true;lostBanner=false;}
+    }
+  }catch(e){
+    if(e.error!=="auth"){showBanner("無法讀取 Google 試算表,請確認網路,或檢查 sheet-config.js 的網址後重新整理。");lostBanner=true;}
+  }finally{refreshing=false;}
+  loaded=true;
+  if(isManagerView()&&tab==="logs")fetchLogs(true);
+  scheduleRender();
+}
+let lostBanner=false;
+function connect(){
+  const url=String(SHEET_API_URL||"");
+  if(!/^https?:\/\//.test(url)){
+    role="local";loaded=true;
+    showBanner("示範模式:尚未設定 Google 試算表(sheet-config.js),資料不會儲存,也不需要密碼。");
+    render();return;
+  }
+  role="online";online=true;
   render();
+  refresh();
+  if(token)api("check").catch(()=>{});
+  setInterval(()=>{if(document.visibilityState==="visible")refresh();},60000);
+  document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")refresh();});
 }
 function scheduleRender(){
   const a=document.activeElement;
@@ -264,31 +300,30 @@ function taskInfo(key){
   const plan=!rest?"":rest.startsWith("w")?`定植後第${rest.slice(1)}週`:rest.startsWith("m")?rest.slice(1):rest;
   return {code,task:r.t,rec:r.rec,plan};
 }
-function addLog(key,action,detail){
+function addLocalLog(key,action,detail){   // demo mode only; online logs are written by Apps Script
   const info=taskInfo(key);
-  const now=new Date();
-  const entry={at:now.toISOString(),key:String(key).slice(0,60),code:info.code.slice(0,20),task:String(info.task).slice(0,80),rec:String(info.rec).slice(0,20),
-    plan:String(info.plan).slice(0,20),who:String(me||(isManagerView()?"管理者":"未具名")).slice(0,40),role:isManagerView()?"manager":"staff",
-    action:String(action).slice(0,20),detail:String(detail||"").slice(0,500)};
-  const id=now.getTime().toString(36)+Math.random().toString(36).slice(2,6);
-  if(!fs){localLogs.push(entry);if(tab==="logs")render();return;}
-  FB.setDoc(FB.doc(fs,"logs",ymd(now)),{[id]:entry,lastKey:id},{merge:true}).catch(()=>{});
+  localLogs.push({at:new Date().toISOString(),key,code:info.code,task:info.task,rec:info.rec,plan:String(info.plan),
+    who:me||(isManagerView()?"管理者":"未具名"),role:isManagerView()?"manager":"staff",action,detail:detail||""});
+  if(tab==="logs")render();
 }
-function subscribeLogs(){
-  if(!fs||!isManagerView()||logSubMonth===logMonth)return;
-  if(logUnsub)logUnsub();
-  logSubMonth=logMonth;logEntries=[];
-  const q=FB.query(FB.collection(fs,"logs"),FB.where(FB.documentId(),">=",logMonth+"-01"),FB.where(FB.documentId(),"<=",logMonth+"-31"));
-  logUnsub=FB.onSnapshot(q,s=>{
-    const all=[];
-    s.docs.forEach(d=>{const x=d.data();for(const k in x){if(k!=="lastKey"&&x[k]&&x[k].at)all.push(x[k]);}});
-    all.sort((a,b)=>b.at.localeCompare(a.at));
-    logEntries=all;scheduleRender();
-  },()=>{logSubMonth="";showBanner("無法讀取工作紀錄,請重新登入管理者。");});
+let logLoading=false;
+function fetchLogs(force){
+  if(!online||!isManagerView())return;
+  if(!force&&logSubMonth===logMonth)return;
+  const month=logMonth;
+  if(logSubMonth!==month)logEntries=[];
+  logSubMonth=month;logLoading=true;
+  api("logs",{month}).then(j=>{
+    if(month!==logMonth)return;
+    logEntries=(j.logs||[]).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
+  }).catch(e=>{
+    if(month===logMonth)logSubMonth="";
+    if(e.error!=="auth")toast("無法讀取工作紀錄,請稍後再試");
+  }).finally(()=>{if(month===logMonth){logLoading=false;scheduleRender();}});
 }
-function unsubscribeLogs(){if(logUnsub)logUnsub();logUnsub=null;logSubMonth="";logEntries=[];}
+function unsubscribeLogs(){logSubMonth="";logEntries=[];logLoading=false;}
 function currentLogs(){
-  const src=fs?logEntries:localLogs.filter(e=>e.at.slice(0,7)===logMonth).sort((a,b)=>b.at.localeCompare(a.at));
+  const src=online?logEntries:localLogs.filter(e=>e.at.slice(0,7)===logMonth).sort((a,b)=>b.at.localeCompare(a.at));
   return src.filter(e=>(logRec==="all"||e.rec===logRec)&&(logWho==="all"||e.who===logWho)&&
     (logAct==="all"||(logAct==="done"&&/完成/.test(e.action)&&!/未完成/.test(e.action))||(logAct==="notdone"&&/未完成|異常/.test(e.action))||(logAct==="assign"&&e.action==="分派")||(logAct==="note"&&e.action==="備註")));
 }
@@ -296,9 +331,9 @@ function fmtTime(iso){const d=new Date(iso);return `${ymd(d)} ${String(d.getHour
 function actClass(a){return /未完成|異常/.test(a)?"issue":/完成/.test(a)?"done":/進行中/.test(a)?"doing":"todo";}
 
 function viewLogs(){
-  subscribeLogs();
+  fetchLogs(false);
   const rows=currentLogs();
-  const base=fs?logEntries:localLogs;
+  const base=online?logEntries:localLogs;
   const who=[...new Set(base.map(e=>e.who))].sort();
   const byRec=Object.fromEntries(REC_SHEETS.map(([r])=>[r,rows.filter(e=>e.rec===r).length]));
   return `<div class="logbar">
@@ -307,16 +342,18 @@ function viewLogs(){
       <label class="field"><span>動作</span><select id="logAct">
         ${[["all","全部"],["done","完成"],["notdone","未完成/異常"],["assign","分派"],["note","備註"]].map(([v,l])=>`<option value="${v}" ${logAct===v?"selected":""}>${l}</option>`).join("")}</select></label>
       <div class="logbtns">
+        ${online?`<button class="btn" id="refreshLogs">重新整理</button>`:""}
+        ${online&&sheetUrl?`<a class="btn" href="${esc(sheetUrl)}" target="_blank" rel="noopener">開啟 Google 試算表</a>`:""}
         <button class="btn primary" id="exportLogs">匯出本月紀錄 Excel</button>
         <a class="btn" href="${PLAN_XLSX}" download="${PLAN_XLSX_NAME}">計畫排程表 Excel</a>
       </div>
     </div>
     <div class="chips">${[["all",`全部 ${rows.length}`],...REC_SHEETS.map(([r])=>[r,`${r} ${byRec[r]}`])].map(([v,l])=>`<button class="chip" data-logrec="${esc(v)}" aria-pressed="${logRec===v}">${esc(l)}</button>`).join("")}</div>
-    <p class="hint">員工回報與管理者的分派、狀態、備註都會自動寫入紀錄,不需另外登打。用量、糖度、溫度等數值仍請填在計畫排程表的紀錄表中。</p>
+    <p class="hint">員工回報與管理者的分派、狀態、備註都會自動寫入${online?" Google 試算表的「工作紀錄」分頁":"紀錄"},不需另外登打。用量、糖度、溫度等數值仍請填在計畫排程表的紀錄表中。</p>
     <div class="tablewrap"><table><thead><tr><th>時間</th><th>工作</th><th>紀錄表</th><th>預定</th><th>人員</th><th>動作</th><th>說明</th></tr></thead><tbody>
       ${rows.length?rows.map(e=>`<tr><td class="num">${fmtTime(e.at)}</td><td><span class="code">${esc(e.code)}</span> ${esc(e.task)}</td><td>${esc(e.rec)}</td><td class="num">${esc(e.plan)}</td>
         <td>${esc(e.who)}${e.role==="manager"?' <span class="tag">管理者</span>':""}</td><td><span class="st ${actClass(e.action)}">${esc(e.action)}</span></td><td>${esc(e.detail)}</td></tr>`).join("")
-        :`<tr><td colspan="7" class="empty-msg">${logMonth} 沒有符合條件的紀錄。</td></tr>`}
+        :`<tr><td colspan="7" class="empty-msg">${logLoading?"正在讀取 Google 試算表…":`${logMonth} 沒有符合條件的紀錄。`}</td></tr>`}
     </tbody></table></div>`;
 }
 
@@ -462,7 +499,7 @@ function renderHeader(b){
   if(!tabs.some(x=>x[0]===tab))tab="today";
   $("#tabs").innerHTML=tabs.map(([k,l])=>`<button role="tab" data-tab="${k}" aria-selected="${tab===k}">${l}</button>`).join("");
   const rb=$("#rolebar");
-  if(mgr)rb.innerHTML=`<span class="rolepill">管理者</span><a class="btn" href="${PLAN_XLSX}" download="${PLAN_XLSX_NAME}" title="下載溫室土耕小番茄_種植工作計畫排程表">計畫排程表 Excel</a><button class="btn" data-tab="logs">工作紀錄</button>${role==="local"?"":`<button class="btn" id="logoutMgr">登出管理者</button>`}`;
+  if(mgr)rb.innerHTML=`<span class="rolepill">管理者</span>${online&&sheetUrl?`<a class="btn" href="${esc(sheetUrl)}" target="_blank" rel="noopener" title="開啟存放資料的 Google 試算表">Google 試算表</a>`:""}<a class="btn" href="${PLAN_XLSX}" download="${PLAN_XLSX_NAME}" title="下載溫室土耕小番茄_種植工作計畫排程表">計畫排程表 Excel</a><button class="btn" data-tab="logs">工作紀錄</button>${role==="local"?"":`<button class="btn" id="logoutMgr">登出管理者</button>`}`;
   else rb.innerHTML=`<span class="rolepill staffp">員工</span><button class="btn" id="openLogin" aria-expanded="${loginOpen}">管理者登入</button>`;
 }
 
@@ -637,21 +674,16 @@ function loginHTML(){
       <label class="field" style="flex:1 1 200px"><span>管理者密碼</span><input id="pw-login" type="password" autocomplete="current-password"></label>
       <button class="btn primary" type="submit" id="loginBtn">登入</button><button class="btn" type="button" id="closeLogin">關閉</button>
     </form>
-    <p class="hint"><button class="linkbtn" id="resetMail" type="button">忘記密碼?寄送重設密碼信到管理者信箱</button></p></div>`;
-}
-function authErr(e){
-  const c=e&&e.code||"";
-  if(c.includes("wrong-password")||c.includes("invalid-credential")||c.includes("invalid-login"))return"密碼不正確";
-  if(c.includes("too-many-requests"))return"嘗試次數過多,請稍後再試";
-  if(c.includes("network"))return"網路連線失敗";
-  if(c.includes("requires-recent-login"))return"請先登出再重新登入後變更";
-  if(c.includes("weak-password"))return"新密碼至少 6 碼";
-  return"登入失敗:"+c;
+    <p class="hint">忘記密碼:打開 Google 試算表 →「擴充功能 → Apps Script」,上方選 resetPassword 按「執行」,密碼會回到當初設定的初始密碼。</p></div>`;
 }
 function render(){
   const b=build(viewDate);
   renderHeader(b);
   const mgr=isManagerView();
+  if(role==="online"&&!loaded){
+    $("#view").innerHTML=loginHTML()+`<div class="list" style="margin-top:18px"><div class="empty-msg">正在讀取 Google 試算表…</div></div>`;
+    $("#meWrap").hidden=true;return;
+  }
   let html="";
   if(tab==="plan")html=viewPlan(b);
   else if(mgr&&tab==="people")html=viewPeople(b);
@@ -670,17 +702,17 @@ document.addEventListener("click",e=>{
   if(t.dataset.pickme!=null){me=t.dataset.pickme;try{localStorage.setItem("tomato.me",me);}catch(_){}render();return;}
   if(t.id==="openLogin"){loginOpen=!loginOpen;render();const i=document.getElementById("pw-login");if(i)i.focus();return;}
   if(t.id==="closeLogin"){loginOpen=false;render();return;}
-  if(t.id==="resetMail"){
-    if(!fbAuth){toast("示範模式無法寄信");return;}
-    FB.sendPasswordResetEmail(fbAuth,MANAGER_EMAIL).then(()=>toast("已寄出重設密碼信到管理者信箱")).catch(e=>toast(authErr(e)));return;}
-  if(t.id==="logoutMgr"){unsubscribeLogs();if(fbAuth)FB.signOut(fbAuth);tab="today";loginOpen=false;render();toast("已登出管理者");return;}
+  if(t.id==="logoutMgr"){if(online)api("logout").catch(()=>{});saveToken("");unsubscribeLogs();tab="today";loginOpen=false;render();toast("已登出管理者");return;}
+  if(t.id==="refreshLogs"){fetchLogs(true);render();return;}
   if(t.id==="changePw"){
     const cur=$("#pw-cur").value,a=$("#pw-new").value,c2=$("#pw-new2").value;
-    if(!fbAuth||!user){toast("請先登入管理者");return;}
+    if(!online||!token){toast("示範模式無法變更密碼");return;}
+    if(!cur){toast("請輸入目前密碼");return;}
     if(a.length<6){toast("新密碼至少 6 碼");return;}
     if(a!==c2){toast("兩次輸入的新密碼不一致");return;}
-    FB.reauthenticateWithCredential(user,FB.EmailAuthProvider.credential(MANAGER_EMAIL,cur))
-      .then(()=>FB.updatePassword(user,a)).then(()=>{render();toast("已變更管理者密碼");}).catch(e=>toast(authErr(e)));
+    t.disabled=true;
+    api("changePw",{current:cur,next:a}).then(()=>{render();toast("已變更管理者密碼");})
+      .catch(e=>{t.disabled=false;toast(apiErr(e));});
     return;}
   if(t.dataset.logrec){logRec=t.dataset.logrec;render();return;}
   if(t.id==="exportLogs"){exportLogs();return;}
@@ -718,11 +750,11 @@ document.addEventListener("keydown",e=>{if(e.target.id==="newStaff"&&e.key==="En
 document.addEventListener("submit",e=>{
   if(e.target.id==="loginForm"){e.preventDefault();
     const pw=$("#pw-login").value;if(!pw)return;
-    if(!fbAuth){toast("示範模式不需要登入");return;}
+    if(!online){toast("示範模式不需要登入");return;}
     $("#loginBtn").disabled=true;
-    FB.signInWithEmailAndPassword(fbAuth,MANAGER_EMAIL,pw)
-      .then(()=>{loginOpen=false;tab="today";render();toast("已登入管理者");})
-      .catch(e=>{toast(authErr(e));const b=$("#loginBtn");if(b)b.disabled=false;const i=$("#pw-login");if(i)i.select();});
+    api("login",{password:pw})
+      .then(j=>{saveToken(j.token,j.sheetUrl);loginOpen=false;tab="today";render();toast("已登入管理者");})
+      .catch(e=>{toast(apiErr(e));const b=$("#loginBtn");if(b)b.disabled=false;const i=$("#pw-login");if(i)i.select();});
     return;}
   if(e.target.id!=="cfgForm")return;e.preventDefault();
   const v=id=>document.getElementById(id).value;const n=(id,min)=>{const x=Number(v(id));return Number.isFinite(x)?Math.max(min,x):cfg[id.slice(2)];};
