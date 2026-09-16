@@ -135,7 +135,8 @@ const reasonOpen=new Set();
 let me="";
 try{me=localStorage.getItem("tomato.me")||"";}catch(e){}
 let pendingRender=false;
-const isManagerView=()=>role==="local"||(role==="online"&&!!token);
+let demoStaff=false;       // demo mode only: preview the staff view
+const isManagerView=()=>role==="local"?!demoStaff:(role==="online"&&!!token);
 
 /* ---------- instances ---------- */
 function build(date){
@@ -499,8 +500,8 @@ function renderHeader(b){
   if(!tabs.some(x=>x[0]===tab))tab="today";
   $("#tabs").innerHTML=tabs.map(([k,l])=>`<button role="tab" data-tab="${k}" aria-selected="${tab===k}">${l}</button>`).join("");
   const rb=$("#rolebar");
-  if(mgr)rb.innerHTML=`<span class="rolepill">管理者</span>${online&&sheetUrl?`<a class="btn" href="${esc(sheetUrl)}" target="_blank" rel="noopener" title="開啟存放資料的 Google 試算表">Google 試算表</a>`:""}<a class="btn" href="${PLAN_XLSX}" download="${PLAN_XLSX_NAME}" title="下載空白的溫室土耕小番茄_種植工作計畫排程表(範本,不含網頁上的資料)">下載空白排程表</a><button class="btn" data-tab="logs">工作紀錄</button>${role==="local"?"":`<button class="btn" id="logoutMgr">登出管理者</button>`}`;
-  else rb.innerHTML=`<span class="rolepill staffp">員工</span><button class="btn" id="openLogin" aria-expanded="${loginOpen}">管理者登入</button>`;
+  if(mgr)rb.innerHTML=`<span class="rolepill">管理者</span>${online&&sheetUrl?`<a class="btn" href="${esc(sheetUrl)}" target="_blank" rel="noopener" title="開啟存放資料的 Google 試算表">Google 試算表</a>`:""}<a class="btn" href="${PLAN_XLSX}" download="${PLAN_XLSX_NAME}" title="下載空白的溫室土耕小番茄_種植工作計畫排程表(範本,不含網頁上的資料)">下載空白排程表</a><button class="btn" data-tab="logs">工作紀錄</button>${role==="local"?`<button class="btn" id="demoStaff">試用員工檢視</button>`:`<button class="btn" id="logoutMgr">登出管理者</button>`}`;
+  else rb.innerHTML=`<span class="rolepill staffp">員工</span>${role==="local"?`<button class="btn" id="demoMgr">切回管理者檢視</button>`:`<button class="btn" id="openLogin" aria-expanded="${loginOpen}">管理者登入</button>`}`;
 }
 
 function viewToday(b){
@@ -694,6 +695,22 @@ function render(){
   $("#meWrap").hidden=!mgr&&!(me&&cfg.staff.includes(me));
 }
 
+/* ---------- demo: try the staff view ---------- */
+function enterDemoStaff(){
+  if(!cfg.staff.length){
+    cfg={...cfg,staff:["王小明","李大華"]};
+    const b=build(viewDate);let i=0;
+    const at=new Date(Date.now()-60000).toISOString();
+    [...b.overdue,...b.thisWeek,...b.daily,...b.weekly,...b.monthly,...b.upcoming].forEach(t=>{
+      if(!(statusMap[t.key]||{}).assignee)statusMap={...statusMap,[t.key]:{status:"todo",assignee:cfg.staff[i++%2],note:"",by:"示範",at}};
+    });
+    toast("示範:已加入範例人員「王小明、李大華」並分派工作");
+  }
+  if(!cfg.staff.includes(me))me="";
+  demoStaff=true;tab="today";loginOpen=false;
+  render();window.scrollTo(0,0);
+}
+
 /* ---------- events ---------- */
 document.addEventListener("click",e=>{
   const t=e.target.closest("button");if(!t)return;
@@ -702,6 +719,8 @@ document.addEventListener("click",e=>{
   if(t.dataset.pickme!=null){me=t.dataset.pickme;try{localStorage.setItem("tomato.me",me);}catch(_){}render();return;}
   if(t.id==="openLogin"){loginOpen=!loginOpen;render();const i=document.getElementById("pw-login");if(i)i.focus();return;}
   if(t.id==="closeLogin"){loginOpen=false;render();return;}
+  if(t.id==="demoStaff"){enterDemoStaff();return;}
+  if(t.id==="demoMgr"){demoStaff=false;tab="today";render();window.scrollTo(0,0);toast("已切回管理者檢視");return;}
   if(t.id==="logoutMgr"){if(online)api("logout").catch(()=>{});saveToken("");unsubscribeLogs();tab="today";loginOpen=false;render();toast("已登出管理者");return;}
   if(t.id==="refreshLogs"){fetchLogs(true);render();return;}
   if(t.id==="changePw"){
